@@ -16,6 +16,11 @@ const selected = new Set(); // socket ids that have selected this hand
 function driver(sock, getId, label) {
   sock.on('errorMsg', (m) => log(`[${label}] error: ${m}`));
   sock.on('roomState', (st) => {
+    // Dealer's choice: whoever is on the clock picks the game (and Number's target).
+    if (st.youAreDealer && st.awaitingDealerPick) {
+      if (st.awaitingTripleNineTarget) sock.emit('hostSetTripleNineNumber', 500);
+      else sock.emit('hostSetVariant', st.settings.variant);
+    }
     const myId = getId();
 
     if (st.youAreHost && st.joinRequests) {
