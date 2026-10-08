@@ -11,19 +11,52 @@ side pots, hand evaluation, and pot awarding, and the client only renders
 state it's told about. Reconnect mid-hand from a refresh and your seat is
 still yours. Play money only — settle up offline.
 
-**Live:** https://playpoker.onrender.com
+It runs as a small distributed system: **three game servers behind an nginx
+load balancer, sharing every table through Redis.** Any server can serve any
+player, so you can kill a server in the middle of a hand and the game carries on.
+
+## Architecture
+
+```
+ players ──► nginx (round-robin, WebSockets)
+               ├─► server-1 ┐
+               ├─► server-2 ├─► Redis
+               └─► server-3 ┘
+```
+
+Redis does four jobs:
+
+- **Storage** — each table is saved in Redis after every change, so no server owns it.
+- **Locking** — a per-table lock means two servers never change the same table at once.
+- **Pub/sub** — the Socket.IO Redis adapter delivers each player's update through
+  whichever server holds their connection.
+- **Timers** — auto-deal / auto-pick deadlines sit in a sorted set every server polls;
+  exactly one claims each, so they fire once, even if the server that set them dies.
 
 ## Stack
 
 - **client/** — React + Vite + TypeScript + Tailwind
 - **server/** — Node.js + Express + Socket.IO + TypeScript (game engine lives here)
 - **shared/** — TypeScript types shared by both (`@poker/shared`)
+- **Infra** — Docker Compose, nginx, Redis; hosted on a Google Cloud e2-micro VM
 
 ## Run
 
+The full cluster (needs Docker):
+
 ```bash
-npm install          # installs all workspaces
-npm run dev          # server (:3001) + client (:5173)
+docker compose up -d --build     # nginx + 3 servers + Redis
+```
+
+Open http://localhost:8080. A small label in the header shows which server you're on.
+Try `docker stop playpoker-server-2-1` mid-hand and watch the game continue.
+
+For development (one server, hot reload):
+
+```bash
+npm install                      # installs all workspaces
+docker compose up -d redis       # the server needs Redis
+npm run dev                      # server (:3001) + client (:5173)
 ```
 
 Open http://localhost:5173. The dev server also listens on the LAN, so
@@ -35,9 +68,14 @@ friends on the same network can join at `http://<your-lan-ip>:5173/game/<roomId>
 npm test             # vitest unit tests on the engine
 ```
 
-End-to-end socket scripts (against a server on `:3001`, or set `SMOKE_URL`):
+End-to-end socket scripts (against a server on `:3001`, or set `SMOKE_URL`,
+e.g. `http://localhost:8080` for the cluster):
 `scripts/smoke.mjs`, `scripts/reconnect.mjs`, `scripts/variant.mjs`
 (`VARIANT=...`), `scripts/pineapple.mjs`, `scripts/bomb.mjs`.
+
+Failover (against the running cluster): `node scripts/failover.mjs` stops the
+server a player is on mid-hand and checks the hand still finishes, then does the
+same to the server that armed an auto-deal timer and checks it still fires.
 
 UI smoke (Playwright, needs `npx playwright install chromium`):
 `scripts/verify-ui.mjs` (host + guest happy path), `scripts/verify-ui-6players.mjs`

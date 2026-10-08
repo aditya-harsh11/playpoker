@@ -1,14 +1,15 @@
 # Play Poker — Dev Notes
 
 Working reference for the codebase: how it's put together, the non-obvious bits, and how to
-run/extend it. (User-facing intro is in `README.md`; deploying is in `DEPLOY.md`.)
+run/extend it. (User-facing intro is in `README.md`; deploying is under "Deployment" below.)
 
 ## What it is
 A real-time, **play-chip** multiplayer poker room with every common variant on one table —
 between hands, the dealer-on-the-button picks what gets dealt next. A host creates a game, shares a
 link, and up to 8 guests join (host approves). The **server runs the whole game** — dealing,
 blinds/antes, betting, all-ins, side pots, hand evaluation, pot awarding — across many independent
-tables at once.
+tables at once. It runs as **3 game servers behind nginx, sharing all tables through Redis**, so any
+server can serve any player and a server can die mid-hand without the game stopping.
 
 ## Stack & layout (npm workspaces monorepo)
 ```
@@ -16,6 +17,8 @@ shared/   @poker/shared — TS types shared by client & server (cards, events, s
 server/   Node + Express + Socket.IO + the authoritative game engine (run with tsx)
 client/   React + Vite + Tailwind v4
 scripts/  *.mjs end-to-end socket tests (run against a live server)
+nginx/    nginx.conf — the load balancer in front of the 3 servers
+Dockerfile, docker-compose.yml — the cluster: redis + server-1/2/3 + nginx
 ```
 - **Shared types are the contract.** Client and server both import `@poker/shared`; the Socket.IO
   events are typed there (`ClientToServerEvents` / `ServerToClientEvents`).
@@ -25,12 +28,17 @@ scripts/  *.mjs end-to-end socket tests (run against a live server)
 ## Run / build / test
 ```bash
 npm install
+docker compose up -d redis   # every server needs Redis (REDIS_URL, default redis://localhost:6379)
 npm run dev        # server :3001 + client :5173 (concurrently)
-npm test           # server engine unit tests (vitest)
+npm test           # server engine unit tests (vitest) — no Redis needed
 npm run build      # builds the client into client/dist
-npm start          # runs the server; in prod it also serves client/dist (single-host)
+npm start          # runs one server; it also serves client/dist if built
+
+docker compose up -d --build # the full cluster at http://localhost:8080
+node scripts/failover.mjs    # kill-a-server tests against the cluster
 ```
-**End-to-end socket scripts** (start a server first, point with `SMOKE_URL`):
+**End-to-end socket scripts** (start a server first, point with `SMOKE_URL`; use
+`http://localhost:8080` to run them through the cluster, so players land on different servers):
 ```bash
 PORT=3010 npx tsx watch server/src/index.ts          # a server to test against
 SMOKE_URL=http://localhost:3010 node scripts/smoke.mjs            # full Texas hand
@@ -40,6 +48,8 @@ VARIANT=bomb-omaha SMOKE_URL=... node scripts/bomb.mjs            # bomb pots
 node scripts/{reconnect,allinshow,note,handname,multivariant}.mjs
 ```
 They assert invariants (chips conserved, correct phases) rather than exact winners (deck is random).
+Each script's dealer picks `settings.variant` when put on the clock. `VARIANT=triple9` with
+`variant.mjs` does **not** work (it picks 2 cards; Number needs an ordered 3) — the unit tests cover it.
 
 ## Architecture
 **Server-authoritative.** The full deck and every hole card live only on the server. Each client
@@ -47,13 +57,63 @@ gets a **redacted, per-recipient snapshot** (`Room.snapshotFor(viewerId)`) — y
 cards (others' only when revealed). Clients send *intents*; the server validates everything. Deck is
 shuffled with `crypto.randomInt` (Fisher–Yates).
 
-**Rooms.** `RoomManager` holds a `Map<roomId, Room>`. Each `Room` is fully independent (its own
-players, chips, and current `PokerGame`). Many tables run on one process; an event in one room only
-re-broadcasts to that room. Room state is **in memory** (no DB).
+**Rooms.** Each `Room` is fully independent (its own players, chips, and current `PokerGame`).
+Rooms live in **Redis**, not in any server's memory — see "Distributed setup" below. An event in one
+room only re-broadcasts to that room.
 
-**Flow:** client emits → `net/socketHandlers.ts` validates (zod for actions) and calls a `Room`
-method → `Room` mutates state / delegates to `PokerGame` → `broadcast(io, room)` sends each socket
-its own snapshot.
+**Flow:** client emits → `net/socketHandlers.ts` validates (zod for actions) →
+`roomManager.withRoom(id, fn)` locks the table, loads it from Redis, runs `fn` (calls a `Room` method
+→ `Room` mutates state / delegates to `PokerGame` → `broadcast(io, room)` sends each socket its own
+snapshot), saves it, unlocks.
+
+## Distributed setup
+```
+ players ──► nginx (:80, round-robin, WebSockets)
+               ├─► server-1 ┐
+               ├─► server-2 ├─► Redis (tables, locks, timers, pub/sub)
+               └─► server-3 ┘
+```
+**Redis keys**
+- `room:<id>` — the whole table as JSON (`rooms/serialize.ts`), 24h expiry refreshed on each save.
+- `lock:room:<id>` — the table's lock (random token, 5s expiry).
+- `timers` — sorted set of pending auto-start / auto-pick deadlines: member `<roomId>:autoStart` or
+  `<roomId>:autoPick`, score = due time (ms).
+- Socket.IO adapter pub/sub channels (`socket.io#…`).
+
+**Save/load (`rooms/serialize.ts`).** Generic JSON with `Map`/`Set` tagged as `{__map}` / `{__set}`;
+on load, the `Room` / `PokerGame` / `Deck` prototypes are restored (no `#private` fields anywhere, so
+this works). `PokerGame.seats` holds **the same objects** as `room.players` (the engine mutates them),
+so load re-links seats to `room.players` by id; a player removed mid-hand keeps their saved copy.
+New fields on these classes are saved automatically. **Don't add `#private` fields, functions, or
+class instances other than these three to `Room`/`PokerGame`** — they won't survive a save.
+
+**Locking (`rooms/roomManager.ts`).** `withRoom` takes `SET lock:room:<id> <token> NX PX 5000`,
+retrying for up to 3s, and releases with a Lua "delete only if still my token" script. The expiry
+means a server that dies holding a lock can't freeze the table. Everything that changes a room goes
+through `withRoom`; `create` uses `SET … NX` so two servers can't mint the same room id. A room left
+with no players or requests is deleted on save.
+
+**Messaging.** `@socket.io/redis-adapter`. `broadcast` / `pushHoleCards` still emit per socket id;
+the adapter publishes them, and whichever server holds that socket delivers it. The server that made
+the change builds every viewer's private snapshot — Redis only carries finished messages. The main
+Redis connection is shared by data commands and the adapter's publishes, so a broadcast always
+reaches Redis before the lock release that follows it (order is kept per connection).
+
+**Timers.** `Room` no longer uses `setTimeout`. Scheduling only sets `autoStartAt` / `autoPickAt`;
+every save mirrors those into `timers`. Each server polls `timers` every 500ms
+(`startTimerPoller` in `socketHandlers.ts`); for a due entry, `ZREM` returning 1 means *this* server
+won it (atomic, so exactly one does), and it runs `room.fireAutoStart()` / `fireAutoPick()` under the
+lock. Those re-check the deadline, so a stale entry is harmless, and any later save re-adds an entry a
+crashed server lost mid-claim.
+
+**Connections.** The client is **WebSocket-only**, so a connection stays on one server and nginx can
+round-robin without sticky sessions (long-polling would need them). If a server dies, its players'
+sockets drop, the client reconnects (nginx skips the dead server — `proxy_next_upstream`) and re-sends
+`rejoin`, which re-points their seat's `socketId`. The `disconnect` handler only clears `socketId` if
+it still matches that socket, because the player may already be back through another server.
+`connectionStateRecovery` was removed (this adapter doesn't support it; `rejoin` covers it).
+Each server sends `serverInfo` (its `SERVER_ID`) on connect; the client shows it in the header so
+you can watch a player move servers. `/health` also returns `serverId`.
 
 ### Key server files
 - `engine/deck.ts` — secure shuffle + deal.
@@ -65,7 +125,10 @@ its own snapshot.
 - `engine/sidePots.ts` — layered side-pot construction from per-player contributions.
 - `engine/pokerGame.ts` — **the heart.** One hand's lifecycle + betting state machine.
 - `rooms/room.ts` — lobby, seats, chip ledger, host controls, snapshot/redaction.
-- `rooms/roomManager.ts`, `net/socketHandlers.ts`, `index.ts`.
+- `rooms/roomManager.ts` — Redis-backed table store: `create`, `withRoom` (lock/load/save), timer sync.
+- `rooms/serialize.ts` — room ⇄ JSON.
+- `redis.ts` — the two Redis connections (main + adapter subscriber).
+- `net/socketHandlers.ts` (handlers + timer poller), `index.ts` (adapter, `SERVER_ID`, `/health`).
 
 ### Betting state machine (pokerGame.ts)
 Per street it tracks `currentBet`, `minRaise`, `lastFullRaiseBet`, `actedThisStreet`,
@@ -142,17 +205,15 @@ authorizes via `canPickGame` = dealer **or** host fallback before any dealer exi
 shows these between hands: dealer sees "Your deal — pick the game" + Change game; host sees Deal.
 
 ## Client notes
-- `lib/socket.ts` — single Socket.IO singleton. Connects to `VITE_SERVER_URL` if set, else `:3001`
-  in dev, else same-origin in prod. Reconnects forever with backoff. Exports `serverBase` for plain
-  HTTP (the keep-alive).
-- `lib/useRoom.ts` — subscribes to `roomState` / `yourCards`; tracks `connected`; on
-  every (re)connect `GameRoom` re-sends `rejoin` with the localStorage session token, so a
-  refresh/drop reclaims your seat (token-based reconnection). Also runs a **keep-alive** (prod only):
-  `fetch('/health')` every 4 min while a table is open, so free hosts that gauge idleness by HTTP
-  traffic don't spin the WebSocket-only server down mid-game (see Deployment).
+- `lib/socket.ts` — single Socket.IO singleton, **WebSocket-only** (see Connections). Connects to
+  `VITE_SERVER_URL` if set, else `:3001` in dev, else same-origin in prod. Reconnects forever with
+  backoff. Remembers `currentServerId` from `serverInfo` (it arrives on connect, before any page listens).
+- `lib/useRoom.ts` — subscribes to `roomState` / `yourCards` / `serverInfo`; tracks `connected` and
+  `serverId`; on every (re)connect `GameRoom` re-sends `rejoin` with the localStorage session token, so
+  a refresh/drop — or the player's server dying — reclaims your seat (token-based reconnection).
 - **Reconnection UX (`GameRoom`):** while `!connected` a blocking **"Reconnecting…"** overlay covers
   the table (no clicking dead buttons). If `rejoin` comes back **"Room not found"** (server
-  restarted/slept → tables wiped) it shows a **"Table unavailable"** screen (Home / Try again) instead
+  tables expired or Redis was wiped) it shows a **"Table unavailable"** screen (Home / Try again) instead
   of a stale, dead UI. "Session not found" (room alive, you were removed) → the join screen.
 - `components/Table.tsx` — oval table; seats positioned by angle, rotated so **you** sit at the
   bottom. Rendered at a fixed design size (`DESIGN_W=1150`) and **scaled to fill the container width**
@@ -187,31 +248,61 @@ shows these between hands: dealer sees "Your deal — pick the game" + Change ga
 
 ## Resilience (server)
 - Every socket handler is registered through a `safe`/`on` wrapper in `socketHandlers.ts` that
-  try/catches — a throw in one handler can't crash the process (which would drop **every** table).
-- `index.ts` adds `uncaughtException` / `unhandledRejection` logging (last-resort), tuned
-  `pingInterval`/`pingTimeout` (20s/20s), and Socket.IO `connectionStateRecovery` (brief drops
-  recover seamlessly). The client retries reconnection forever.
+  try/catches (and awaits — handlers are async now) — a throw in one handler can't crash the process.
+- `index.ts` adds `uncaughtException` / `unhandledRejection` logging (last-resort) and tuned
+  `pingInterval`/`pingTimeout` (20s/20s). The client retries reconnection forever.
+- Any one server can die (or be redeployed) without losing tables; see Distributed setup.
+  Redis keeps an append-only file on a Docker volume, so even a Redis restart keeps tables.
+- `scripts/failover.mjs` proves both halves: a hand finishes after the host's server is stopped
+  mid-hand, and an auto-deal still fires after the server that armed it is stopped.
 
-## Deployment & scale
-- **Single-host:** the server serves `client/dist` when present, so the whole app runs as one Node
-  service (Render/Railway/Fly). See `DEPLOY.md` + `render.yaml`.
-- **Capacity:** one instance easily handles ~100 players across ~15 tables (light load). Fine as-is.
-- **Free-tier idle spin-down (the big one):** free hosts gauge "idle" by **HTTP requests**, and a live
-  WebSocket sends none → they spin the server down **mid-game** (~15 min) and wipe all tables. The
-  client keep-alive (`useRoom.ts`, prod only) pings `/health` every 4 min while a table is open;
-  for always-on, point an external uptime pinger at `/health`. See `DEPLOY.md` for both. Cold start
-  ~50s; the client shows "Reconnecting…" then "Table unavailable" if the room is gone.
-- **Limits (single instance, in-memory):** a restart/redeploy/crash **wipes all active games**. For
-  real always-on use → small paid instance. To scale past thousands → Socket.IO Redis adapter + move
-  room state into Redis/DB (and that would also make restarts non-destructive).
+## Deployment
+**The cluster** (`docker-compose.yml`): `redis` (redis:7-alpine, AOF on, 64 MB cap, `noeviction` so
+game data is never dropped; bound to `127.0.0.1:6379` for local dev only), `server-1/2/3` (one image
+from `Dockerfile`, different `SERVER_ID`, 200 MB / 128 MB heap caps), `nginx` (host port
+`HTTP_PORT`, default 8080). All `restart: unless-stopped` — a crash restarts, a `docker stop` stays
+stopped (for demos). nginx re-resolves container names every 5s (`resolve`) so a restarted container's
+new IP is picked up. Whole cluster uses ~350 MB.
+
+**Hosting: Google Cloud free tier (e2-micro, free forever within limits).**
+1. Create a GCP account (asks for a card; the free tier doesn't charge). Set a **budget alert**
+   (Billing → Budgets) at e.g. $1 so any surprise cost emails you.
+2. Compute Engine → Create instance: machine **e2-micro**, region **us-central1, us-east1 or
+   us-west1** (only these are free), boot disk **Ubuntu LTS, 30 GB standard persistent disk**,
+   firewall: **allow HTTP**. Check the free-tier page for current terms — Google may charge a small
+   amount for the external IPv4 address.
+3. SSH in (button in the console), then:
+   ```bash
+   # 2 GB swap — the VM has 1 GB RAM
+   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile \
+     && sudo swapon /swapfile && echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+   # Docker
+   curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER && newgrp docker
+   # The app
+   git clone <your repo url> playpoker && cd playpoker
+   HTTP_PORT=80 docker compose up -d --build
+   ```
+4. Play at `http://<VM external IP>`. To update: `git pull && HTTP_PORT=80 docker compose up -d --build`
+   (servers restart one image at a time; tables survive in Redis).
+5. Optional: a free DuckDNS subdomain + Let's Encrypt for HTTPS (nginx would need a 443 server block).
+
+Outgoing data is only ~1 GB/month free; a card game sends little, but watch it if it gets popular.
+
+**Scale.** More servers = more `server-N` entries in compose + `nginx.conf`. Redis is the single point
+of failure (and the limit) — beyond one machine you'd add Redis replication/Sentinel and run servers
+on separate VMs.
 
 ## Gotchas
-- **In-memory state**: server restart loses every table (the client now degrades gracefully — see
-  Reconnection UX). `tsx watch` restarts on file save during dev — expect active dev games to reset.
+- **State is in Redis**: server restarts (and `tsx watch` reloads in dev) keep tables. Wiping Redis
+  (`docker compose down -v`) or 24h of inactivity removes them. Changing the shape of `Room` /
+  `PokerGame` can break loading tables saved by older code — wipe Redis after such changes in dev.
+- **Never touch a room outside `withRoom`** — a change made without the lock, or not saved, is lost
+  or races another server.
 - **One browser = one identity** (session token in localStorage, keyed by room). Test multiple
   players with separate browsers / incognito / devices.
 - Snapshots are **per-recipient** — don't leak data by broadcasting one shared payload; always go
   through `Room.snapshotFor`.
+- **Free-tier VM has 1 GB RAM** — keep the swap file, and keep an eye on memory before adding services.
 - Hand evaluation/comparison is delegated to `pokersolver`; the selection/advisor logic forces
   specific hole cards via `bestHandUsing`, so don't replace it with a plain `solve` of the union.
 - `pokersolver` is CommonJS — import the default and destructure (`import pkg from 'pokersolver'`).
