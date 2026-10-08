@@ -69,4 +69,6 @@ export interface ServerToClientEvents {
   /** Private hole cards for the recipient (also embedded in RoomState, sent for convenience). */
   yourCards: (cards: Card[]) => void;
   errorMsg: (message: string) => void;
+  /** Sent on connect: which of the load-balanced servers this connection landed on. */
+  serverInfo: (info: { serverId: string }) => void;
 }

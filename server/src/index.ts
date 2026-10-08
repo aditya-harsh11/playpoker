@@ -4,12 +4,16 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import express from 'express';
 import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import type { ClientToServerEvents, ServerToClientEvents } from '@poker/shared';
-import { registerHandlers, type SocketData } from './net/socketHandlers';
+import { registerHandlers, startTimerPoller, type SocketData } from './net/socketHandlers';
+import { redis, redisSub, connectRedis } from './redis';
+
+const SERVER_ID = process.env.SERVER_ID ?? 'server';
 
 const app = express();
 app.get('/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, serverId: SERVER_ID });
 });
 
 // In production, serve the built client from this same server (single-host deploy).
@@ -33,15 +37,15 @@ const io = new Server<
   // recovers) without being so twitchy that brief mobile lag drops players.
   pingInterval: 20_000,
   pingTimeout: 20_000,
-  // Seamlessly restore a socket (its rooms + missed events) after a brief drop,
-  // so a momentary "reconnecting…" doesn't drop a player out of the hand.
-  connectionStateRecovery: {
-    maxDisconnectionDuration: 2 * 60 * 1000,
-    skipMiddlewares: true,
-  },
 });
 
+// Tables live in Redis and players can be on any server, so emits go through Redis
+// pub/sub: a message for a socket on another server gets delivered by that server.
+await connectRedis();
+io.adapter(createAdapter(redis, redisSub));
+
 registerHandlers(io);
+startTimerPoller(io);
 
 // A single bad event must never take the whole server (every active table) down.
 process.on('uncaughtException', (err) => {
@@ -53,5 +57,5 @@ process.on('unhandledRejection', (reason) => {
 
 const PORT = Number(process.env.PORT) || 3001;
 httpServer.listen(PORT, () => {
-  console.log(`[poker] server listening on http://localhost:${PORT}`);
+  console.log(`[poker] ${SERVER_ID} listening on http://localhost:${PORT}`);
 });

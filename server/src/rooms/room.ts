@@ -82,8 +82,8 @@ export class Room {
    * default — the host toggles it via `setAutoStart`.
    */
   autoStart: { enabled: boolean; seconds: number } = { enabled: false, seconds: 5 };
-  private autoStartTimer: ReturnType<typeof setTimeout> | null = null;
-  private autoStartAt: number | null = null;
+  /** Epoch ms the auto-start fires at, or null. The Redis timer queue mirrors this. */
+  autoStartAt: number | null = null;
 
   /**
    * Auto-pick: when enabled, if the on-the-clock dealer doesn't choose a variant within
@@ -91,15 +91,8 @@ export class Room {
    * default — the host toggles it via `setAutoPick`.
    */
   autoPick: { enabled: boolean; seconds: number } = { enabled: false, seconds: 5 };
-  private autoPickTimer: ReturnType<typeof setTimeout> | null = null;
-  private autoPickAt: number | null = null;
-
-  /**
-   * Set by the socket layer so a timer-driven auto-advance (auto-start beginning the next
-   * hand, or auto-pick dealing one) can push fresh hole cards + a snapshot to every client.
-   * Null until wired up.
-   */
-  onAutoAdvance: (() => void) | null = null;
+  /** Epoch ms the auto-pick fires at, or null. The Redis timer queue mirrors this. */
+  autoPickAt: number | null = null;
 
   constructor(id: string, settings: RoomSettings) {
     this.id = id;
@@ -370,33 +363,31 @@ export class Room {
   }
 
   private clearAutoStartTimer(): void {
-    if (this.autoStartTimer) {
-      clearTimeout(this.autoStartTimer);
-      this.autoStartTimer = null;
-    }
     this.autoStartAt = null;
   }
 
   /**
    * Arm the auto-start countdown if conditions allow: feature on, nothing already armed,
    * no hand in progress, not mid-pick, and enough players. Safe to call repeatedly — it
-   * no-ops while a timer is already pending.
+   * no-ops while a countdown is already pending. Only sets the deadline; a server's timer
+   * poller calls `fireAutoStart` once it passes.
    */
   private scheduleAutoStart(): void {
-    if (!this.autoStart.enabled || this.autoStartTimer) return;
+    if (!this.autoStart.enabled || this.autoStartAt !== null) return;
     if (this.handInProgress() || this.awaitingDealerPick) return;
     if (this.eligiblePlayers().length < 2) return;
-    const ms = this.autoStart.seconds * 1000;
-    this.autoStartAt = Date.now() + ms;
-    this.autoStartTimer = setTimeout(() => {
-      this.autoStartTimer = null;
-      this.autoStartAt = null;
-      if (!this.autoStart.enabled) return;
-      // Begins the dealer's-choice pick (same as the host clicking "Deal next hand").
-      // If it can't start right now (e.g. players dropped below 2) it simply no-ops.
-      this.startHand();
-      this.onAutoAdvance?.();
-    }, ms);
+    this.autoStartAt = Date.now() + this.autoStart.seconds * 1000;
+  }
+
+  /** Run the auto-start if its deadline has passed. Returns true if anything changed. */
+  fireAutoStart(): boolean {
+    if (this.autoStartAt === null || Date.now() < this.autoStartAt) return false;
+    this.autoStartAt = null;
+    if (!this.autoStart.enabled) return true;
+    // Begins the dealer's-choice pick (same as the host clicking "Deal next hand").
+    // If it can't start right now (e.g. players dropped below 2) it simply no-ops.
+    this.startHand();
+    return true;
   }
 
   // ---- auto-pick ----------------------------------------------------------
@@ -411,40 +402,38 @@ export class Room {
   }
 
   private clearAutoPickTimer(): void {
-    if (this.autoPickTimer) {
-      clearTimeout(this.autoPickTimer);
-      this.autoPickTimer = null;
-    }
     this.autoPickAt = null;
   }
 
   /**
    * Arm the auto-pick countdown while a dealer is on the clock. When it fires, the server
-   * deals the current/last variant on the dealer's behalf. No-ops unless we're actually
-   * awaiting a pick and the feature is on.
+   * deals a random variant on the dealer's behalf. No-ops unless we're actually awaiting a
+   * pick and the feature is on. Only sets the deadline; a server's timer poller calls
+   * `fireAutoPick` once it passes.
    */
   private scheduleAutoPick(): void {
-    if (!this.autoPick.enabled || this.autoPickTimer) return;
+    if (!this.autoPick.enabled || this.autoPickAt !== null) return;
     if (!this.awaitingDealerPick) return;
-    const ms = this.autoPick.seconds * 1000;
-    this.autoPickAt = Date.now() + ms;
-    this.autoPickTimer = setTimeout(() => {
-      this.autoPickTimer = null;
-      this.autoPickAt = null;
-      if (!this.autoPick.enabled || !this.awaitingDealerPick) return;
-      // Pick a random variant on the dealer's behalf, then deal (dealHand reads settings.variant).
-      // Bypasses any Triple 9 number the dealer may have been mid-entry on, same as it
-      // bypasses every other in-progress human choice.
-      const keys = Object.keys(VARIANTS) as Variant[];
-      const choice = keys[Math.floor(Math.random() * keys.length)];
-      this.settings = { ...this.settings, variant: choice };
-      this.awaitingTripleNineTarget = false;
-      if (VARIANTS[choice].tripleNine) {
-        this.pendingTripleNineTarget = Math.floor(Math.random() * 1000);
-      }
-      this.dealHand();
-      this.onAutoAdvance?.();
-    }, ms);
+    this.autoPickAt = Date.now() + this.autoPick.seconds * 1000;
+  }
+
+  /** Run the auto-pick if its deadline has passed. Returns true if anything changed. */
+  fireAutoPick(): boolean {
+    if (this.autoPickAt === null || Date.now() < this.autoPickAt) return false;
+    this.autoPickAt = null;
+    if (!this.autoPick.enabled || !this.awaitingDealerPick) return true;
+    // Pick a random variant on the dealer's behalf, then deal (dealHand reads settings.variant).
+    // Bypasses any Triple 9 number the dealer may have been mid-entry on, same as it
+    // bypasses every other in-progress human choice.
+    const keys = Object.keys(VARIANTS) as Variant[];
+    const choice = keys[Math.floor(Math.random() * keys.length)];
+    this.settings = { ...this.settings, variant: choice };
+    this.awaitingTripleNineTarget = false;
+    if (VARIANTS[choice].tripleNine) {
+      this.pendingTripleNineTarget = Math.floor(Math.random() * 1000);
+    }
+    this.dealHand();
+    return true;
   }
 
   /**
