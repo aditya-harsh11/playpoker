@@ -588,7 +588,7 @@ export default function GameRoom() {
   const { roomId: rawId } = useParams();
   const roomId = (rawId ?? '').toLowerCase();
   const navigate = useNavigate();
-  const { state, error, connected } = useRoom();
+  const { state, error, connected, serverId } = useRoom();
 
   const [needJoin, setNeedJoin] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -782,6 +782,11 @@ export default function GameRoom() {
             )}
           </div>
           {!connected && <span className="text-xs text-crimson">reconnecting…</span>}
+          {connected && serverId && (
+            <span className="font-mono text-[10px] text-ink-dim" title="Which server you're connected to">
+              {serverId}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center justify-end gap-1.5 sm:gap-2">
           <button onClick={() => setShowLedger(true)} className="btn btn-ghost px-2.5 py-1.5 text-sm sm:px-3">
