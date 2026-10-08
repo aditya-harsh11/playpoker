@@ -2,9 +2,10 @@
 #   docker compose up -d --build      → play at http://localhost:8080 (HTTP_PORT=80 on the VM)
 #   docker stop playpoker-server-2-1  → kill one server mid-game; the others carry on
 
+# Built once (by server-1) and shared, so a small VM doesn't build the app three times at once.
 x-server: &server
-  build: .
   image: playpoker
+  pull_policy: never
   restart: unless-stopped
   depends_on: [redis]
   mem_limit: 200m
@@ -27,6 +28,7 @@ services:
 
   server-1:
     <<: *server
+    build: .
     environment: { <<: *server-env, SERVER_ID: server-1 }
   server-2:
     <<: *server
