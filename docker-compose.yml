@@ -1,0 +1,47 @@
+# Three game servers behind nginx, sharing tables through Redis.
+#   docker compose up -d --build      → play at http://localhost:8080 (HTTP_PORT=80 on the VM)
+#   docker stop playpoker-server-2-1  → kill one server mid-game; the others carry on
+
+x-server: &server
+  build: .
+  image: playpoker
+  restart: unless-stopped
+  depends_on: [redis]
+  mem_limit: 200m
+
+x-server-env: &server-env
+  PORT: 3001
+  REDIS_URL: redis://redis:6379
+  NODE_OPTIONS: --max-old-space-size=128
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Keep tables on disk so a Redis restart doesn't wipe them. Never evict game data.
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy noeviction
+    volumes: [redis-data:/data]
+    # Reachable from this machine only (for `npm run dev`), never from the internet.
+    ports: ["127.0.0.1:6379:6379"]
+    restart: unless-stopped
+    mem_limit: 100m
+
+  server-1:
+    <<: *server
+    environment: { <<: *server-env, SERVER_ID: server-1 }
+  server-2:
+    <<: *server
+    environment: { <<: *server-env, SERVER_ID: server-2 }
+  server-3:
+    <<: *server
+    environment: { <<: *server-env, SERVER_ID: server-3 }
+
+  nginx:
+    image: nginx:1.28-alpine
+    ports: ["${HTTP_PORT:-8080}:80"]
+    volumes: [./nginx/nginx.conf:/etc/nginx/nginx.conf:ro]
+    depends_on: [server-1, server-2, server-3]
+    restart: unless-stopped
+    mem_limit: 50m
+
+volumes:
+  redis-data:
